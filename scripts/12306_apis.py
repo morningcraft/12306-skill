@@ -162,6 +162,14 @@ def parse_tickets_info(tickets_data: list[dict[str, Any]], map: dict[str, str]) 
             "sale_time": ticket.get("sale_time", ""),
             "canWebBuy": ticket.get("canWebBuy", ""),
             "button_text_info": ticket.get("button_text_info", ""),
+            # 候补能力。字段语义与实测依据见 describe_houbu_state() 的注释。
+            "houbu_train_flag": ticket.get("houbu_train_flag", ""),
+            "houbu_seat_limit": ticket.get("houbu_seat_limit", ""),
+            "seat_types": ticket.get("seat_types", ""),
+            # 到站是否为该车次终到站 —— 用于解释候补不可用的场合。
+            "end_station_telecode": ticket.get("end_station_telecode", ""),
+            "at_final_station": (ticket.get("to_station_telecode") ==
+                                 ticket.get("end_station_telecode")),
         })
     return result
 
@@ -178,6 +186,59 @@ def format_ticket_status(num: str) -> str:
     return f"{num}票"
 
 
+def describe_houbu_state(ticket_info: dict[str, Any], short: bool = False) -> str | None:
+    """把候补字段翻译成人话；该车次不支持候补时返回 None。
+
+    ---------- 字段语义（2026-09-16 实测，非推测）----------
+
+    `houbu_train_flag` 的**实测**语义是「该车次是否存在无票席别」，
+    而**不是**「是否支持候补」：
+
+        '1' = 至少一个席别无票（可能需要候补）
+        '0' = 全部席别有票（无需候补）
+
+    证据（2026-09-16 实测，北京→南昌）：
+        09-19  D135  四个席别全为「有」  → '0'
+        09-19  D137  二等座为「无」      → '1'
+        09-30  全线席别全为「无」        → 全部 '1'
+
+    `houbu_seat_limit` 是**候补队列已满**的席别代码串
+    （J 二等卧 / I 一等卧 / O 二等座），空串 = 没有席别被占满。
+
+    【证据一】字段随队列渐进填充。同一车次 D133（北京→南昌西），跨三天：
+        09-28 → 'J'      仅二等卧满
+        09-29 → 'JI'     二等卧 + 一等卧满
+        09-30 → 'JOI'    再加二等座满
+    静态标签不会逐席别增长，只有真实队列会。
+
+    【证据二】与 App 行为吻合。用户 2026-09-16 在 12306 App 提交候补：
+        D27 / D133 / D139 → 提示「当前车次候补过多」，无法提交 → 字段非空
+        D135 / D137       → 可正常提交                  → 字段为空串
+    两组完全分离。
+
+    ⚠️ 已知未覆盖的边界（不要在输出里对此下断言）：
+      1. 「字段非空 = 整车次不可提交」还是「仅该席别不可提交」未定性；
+         用户实测表现为**整车次**被拦。
+      2. D131（北京→九江）字段为空串，但用户反馈九江方向候补在 App 里是灰的
+         —— 说明前端可能还有本字段未覆盖的其他灰化规则（例如到站非终到站）。
+    因此这里只做**忠实展示**，不据此推断「能不能提交」。真实可否提交
+    以 12306 App 为准。
+    """
+    limit = ticket_info.get("houbu_seat_limit") or ""
+    # flag='0' 实测出现在「全部席别都有票」的车次上，此时没有候补需求 ——
+    # 不输出这一行，保持结果干净。
+    # 但要防御二者的矛盾情形：即便 flag != '1'，只要 limit 非空
+    # （确实存在已满席别）就必须报出来，宁可多显示也不漏报。
+    if ticket_info.get("houbu_train_flag") != "1" and not limit:
+        return None
+    if not limit:
+        return "-" if short else "🎫 候补：可提交"
+    names = [SEAT_TYPES.get(c, {}).get("name", c) for c in limit]
+    if short:
+        return "候补已满(%s)" % "/".join(names)
+    return "⚠️ 候补队列已满：%s" % "、".join(names)
+
+
 def format_tickets_info(tickets_info: list[dict[str, Any]]) -> str:
     if not tickets_info:
         return "没有查询到相关车次信息"
@@ -191,6 +252,9 @@ def format_tickets_info(tickets_info: list[dict[str, Any]]) -> str:
         if ticket_info.get("canWebBuy") == "IS_TIME_NOT_BUY" and len(sale_time) >= 12:
             info += (f"\n  ⏰ 尚未开售，起售时间 {sale_time[0:4]}-{sale_time[4:6]}-"
                      f"{sale_time[6:8]} {sale_time[8:10]}:{sale_time[10:12]}")
+        houbu_note = describe_houbu_state(ticket_info)
+        if houbu_note:
+            info += f"\n  {houbu_note}"
         for price in ticket_info["prices"]:
             info += f"\n- {price['seat_name']}: {format_ticket_status(price.get('num', ''))} {price['price']}元"
         result += info + "\n"
@@ -200,13 +264,13 @@ def format_tickets_info(tickets_info: list[dict[str, Any]]) -> str:
 def format_tickets_info_csv(tickets_info: list[dict[str, Any]]) -> str:
     if not tickets_info:
         return "没有查询到相关车次信息"
-    result = "车次,出发站,到达站,出发时间,到达时间,历时,票价,特色标签\n"
+    result = "车次,出发站,到达站,出发时间,到达时间,历时,票价,特色标签,候补\n"
     for ticket_info in tickets_info:
         line = f"{ticket_info['start_train_code']},{ticket_info['from_station']}(telecode:{ticket_info['from_station_telecode']}),{ticket_info['to_station']}(telecode:{ticket_info['to_station_telecode']}),{ticket_info['start_time']},{ticket_info['arrive_time']},{ticket_info['lishi']},["
         for price in ticket_info["prices"]:
             line += f"{price['seat_name']}: {format_ticket_status(str(price.get('num', '')))}{price['price']}元,"
         tags = "/" if not ticket_info["dw_flag"] else "&".join(ticket_info["dw_flag"])
-        line += f"],{tags}"
+        line += f"],{tags},{describe_houbu_state(ticket_info, short=True) or '-'}"
         result += line + "\n"
     return result
 
